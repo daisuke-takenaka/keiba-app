@@ -37,7 +37,7 @@ st.markdown("""
         font-size: 14px;
     }
 </style>
-""", unsafe_allow_capacity=True)
+""", unsafe_allow_html=True)
 
 # ==========================================
 # 2. パスワード保護（ログイン認証）
