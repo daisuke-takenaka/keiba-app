@@ -120,6 +120,8 @@ def parse_horse(block, prev_waku):
         ranks, found = class_ranks(r["レース名"])
         r["級順位"] = min(ranks) if ranks else None
         r["級"] = "/".join(dict.fromkeys(found)) if found else "-"
+        if unicodedata.normalize("NFKC", r["場"]).startswith("J"):
+            r["級順位"], r["級"] = -1, "JRA"  # 中央（Ｊ○○）は地方のどのクラスより格上扱い
         if k < len(ent1):
             r["人気"] = int(ent1[k][0])
             r["馬体重"] = ent1[k][1]
@@ -298,7 +300,7 @@ st.dataframe(df, hide_index=True)
 st.caption(
     "○＝その馬の5走平均より良い走（着差が小さい／上がりが速い）。左から前走→5走前。"
     "着差は1着馬との差（自分が1着の時は2着との差をマイナスで表示）。"
-    "脚質は1角位置÷頭数の平均（逃≤0.2／先≤0.4／差≤0.65／追）。先行回数は1角が頭数の上位1/3以内だった走。クラス実績は、過去走のレース名にC1等の表記がある走だけ判定（C1/C2混合戦は格上側で数えます。JRA・未格付などは対象外）。"
+    "脚質は1角位置÷頭数の平均（逃≤0.2／先≤0.4／差≤0.65／追）。先行回数は1角が頭数の上位1/3以内だった走。クラス実績は、過去走のレース名にC1等の表記がある走だけ判定（C1/C2混合戦は格上側で数えます。JRAは格上として必ず数え、未格付・「Ａ一組」など数字のない表記は対象外）。"
 )
 
 front = [r["馬名"] for r in rows if r["脚質"] in ("逃", "先")]
