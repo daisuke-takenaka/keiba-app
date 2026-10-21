@@ -15,7 +15,7 @@ HEADER = re.compile(r"^(\d+)\s+(?:(\d+)\s+)?(\S+)\s+(\S+[（(]\S+[）)])\s+(\S+)
 POP = re.compile(r"^[（(]\s*(\d+)\s*人気\s*[）)]")
 PAST1 = re.compile(r"^(.*?)(\d{2}\.\d{2}\.\d{2})\s+(\S+)\s+(\d+)頭$")
 PAST2 = re.compile(r"^(\S+)\s+(\S+)\s+(\d+)番$")
-SEX = re.compile(r"^[牡牝セ騸]\d+")
+SEX = re.compile(r"^(?:牡|牝|セン|セ|騸)\d+")
 WCHG = re.compile(r"^[（(][+\-＋－±]?\d*[）)]")
 
 
