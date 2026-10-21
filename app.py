@@ -33,7 +33,7 @@ def class_ranks(name):
 
 
 def parse_race_info(lines):
-    info = {"venue": "", "no": "", "title": "", "cond": "", "class": None}
+    info = {"venue": "", "no": "", "title": "", "cond": "", "class": None, "dist": None}
     for i, l in enumerate(lines):
         s = unicodedata.normalize("NFKC", l)
         m = re.search(r"\d{4}年\d+月\d+日\(.\)\s*(.+?)\s*第(\d+)競走", s)
@@ -46,6 +46,8 @@ def parse_race_info(lines):
             s2 = unicodedata.normalize("NFKC", l2).strip()
             if re.match(r"^(ダート|芝)", s2):
                 info["cond"] = s2
+                dm = re.search(r"(\d{3,4})m", s2)
+                info["dist"] = int(dm.group(1)) if dm else None
                 break
             if s2:
                 title.append(s2)
@@ -141,6 +143,11 @@ def parse_horse(block, prev_waku):
             if mg is not None and r["着順"] is not None:
                 r["着差"] = (-mg if mg else 0.0) if r["着順"] == 1 else mg  # 勝ち馬は2着との差をマイナス
             r["1着/2着馬"] = ent3[k][1]
+        if r.get("タイム") and r.get("距離"):
+            mm, ss = r["タイム"].split(":")
+            r["秒/200m"] = round((int(mm) * 60 + float(ss)) / r["距離"] * 200, 3)
+        if "着差" in r and r.get("距離"):
+            r["着差換算"] = round(r["着差"] * 1000 / r["距離"], 3)  # 1000m換算の着差
         runs.append(r)
 
     return {"枠": waku, "馬番": umaban, "馬名": name, "騎手": jockey,
@@ -185,7 +192,51 @@ def avg(xs):
     return sum(xs) / len(xs) if xs else None
 
 
-def analyze(h, today_rank, n_today):
+def improve(vals):
+    """新しい順の値リスト → (古い走の平均 − 新しい走の平均)。正なら向上（小さいほど良い指標）。"""
+    n = len(vals)
+    if n < 2:
+        return None
+    nr = 2 if n >= 3 else 1
+    rc = avg(vals[:nr])
+    pa = avg(vals[nr:])
+    return None if rc is None or pa is None else pa - rc
+
+
+def time_improve(runs, today_dist):
+    """同じ距離で2走以上ある距離だけで、1ハロン(200m)あたりのタイムの向上を見る。"""
+    g = {}
+    for r in runs:
+        if r.get("秒/200m") is not None:
+            g.setdefault(r["距離"], []).append(r["秒/200m"])
+    cands = [(len(v), -abs(d - (today_dist or d)), d) for d, v in g.items() if len(v) >= 2]
+    if not cands:
+        return None
+    v = g[max(cands)[2]]
+    nr = max(1, len(v) // 2)
+    return avg(v[nr:]) - avg(v[:nr])
+
+
+def add_index(rows):
+    """3つの改善量を、出走馬のばらつきで割って（0＝変化なし）平均 → 向上指数。"""
+    keys = ["着差改善", "上がり改善", "タイム改善"]
+    sds = {}
+    for k in keys:
+        xs = [r[k] for r in rows if r[k] is not None]
+        if len(xs) >= 2:
+            m = sum(xs) / len(xs)
+            sds[k] = (sum((x - m) ** 2 for x in xs) / len(xs)) ** 0.5
+    for r in rows:
+        zs = [r[k] / sds[k] for k in keys if r[k] is not None and sds.get(k)]
+        idx = sum(zs) / len(zs) if zs else None
+        r["向上指数"] = round(idx, 2) if idx is not None else None
+        r["トレンド"] = ("－" if idx is None else "↗向上" if idx >= 0.5 else "↘下降" if idx <= -0.5 else "→横ばい")
+        for k in keys:
+            r[k] = round(r[k], 2) if r[k] is not None else None
+    return rows
+
+
+def analyze(h, today_rank, n_today, today_dist=None):
     runs = h["runs"]
     m_mean, m_marks, m_good, m_n = vs_mean([r.get("着差") for r in runs])
     f_mean, f_marks, f_good, f_n = vs_mean([r.get("上がり") for r in runs])
@@ -228,6 +279,9 @@ def analyze(h, today_rank, n_today):
         "着差(前走→)": f"{m_marks} {m_good}/{m_n}",
         "上がり平均": round(f_mean, 2) if f_mean is not None else None,
         "上がり(前走→)": f"{f_marks} {f_good}/{f_n}",
+        "着差改善": improve([r.get("着差換算") for r in runs]),
+        "上がり改善": improve([r.get("上がり") for r in runs]),
+        "タイム改善": time_improve(runs, today_dist),
         "脚質": style,
         "1角平均": round(avg(poss), 1) if poss else None,
         "頭数比": round(a_rel, 2) if a_rel is not None else None,
@@ -287,20 +341,28 @@ today_rank = CLASSES.index(cls) if cls else None
 
 st.markdown(f"**{info['venue']} {info['no']}R** {info['title']}  \n{info['cond']}　／　{len(horses)}頭　／　今回クラス: {cls or '不明'}")
 
-rows = [analyze(h, today_rank, len(horses)) for h in horses]
+rows = add_index([analyze(h, today_rank, len(horses), info["dist"]) for h in horses])
 df = pd.DataFrame(rows)
 
 sort_by = st.radio(
     "並び替え",
-    ["馬番", "今回人気", "人気平均", "着差平均", "上がり平均", "頭数比"],
+    ["馬番", "向上指数", "今回人気", "人気平均", "着差平均", "上がり平均", "頭数比"],
     horizontal=True,
 )
-df = df.sort_values(sort_by, na_position="last")
+df = df.sort_values(sort_by, ascending=(sort_by != "向上指数"), na_position="last")
 st.dataframe(df, hide_index=True)
 st.caption(
     "○＝その馬の5走平均より良い走（着差が小さい／上がりが速い）。左から前走→5走前。"
     "着差は1着馬との差（自分が1着の時は2着との差をマイナスで表示）。"
     "脚質は1角位置÷頭数の平均（逃≤0.2／先≤0.4／差≤0.65／追）。先行回数は1角が頭数の上位1/3以内だった走。クラス実績は、過去走のレース名にC1等の表記がある走だけ判定（C1/C2混合戦は格上側で数えます。JRAは格上として必ず数え、未格付・「Ａ一組」など数字のない表記は対象外）。"
+)
+
+st.caption(
+    "【向上指数】直近2走と、それ以前（3〜5走前）を比べた改善量を3項目で出し、出走馬内のばらつきで割って平均したもの。"
+    "0＝変化なし、＋が向上、−が下降（±0.5で↗/↘）。"
+    "着差改善＝着差(1000m換算・秒)の縮まり、上がり改善＝上がり3Fの短縮(秒)、"
+    "タイム改善＝同じ距離の走どうしの1ハロン(200m)あたりタイムの短縮(秒)。"
+    "距離・馬場・相手が違う走を比べるため目安です。同距離の走が2走未満の馬はタイムの項目が空欄になります。"
 )
 
 front = [r["馬名"] for r in rows if r["脚質"] in ("逃", "先")]
@@ -311,6 +373,6 @@ sel = st.selectbox("馬を選択", [f"{h['馬番']} {h['馬名']}" for h in hors
 h = next(x for x in horses if f"{x['馬番']} {x['馬名']}" == sel)
 st.caption(f"{h['騎手']}　斤量{h['斤量']}　馬体重{h['馬体重']}")
 cols = ["走", "日付", "場", "コース", "馬場", "頭数", "級", "着順", "人気", "着差",
-        "上がり", "通過", "騎手", "斤量", "レース名"]
+        "着差換算", "上がり", "秒/200m", "通過", "騎手", "斤量", "レース名"]
 detail = pd.DataFrame(h["runs"])
 st.dataframe(detail[[c for c in cols if c in detail.columns]], hide_index=True)
