@@ -9,6 +9,8 @@ import streamlit as st
 # =====================================================
 MARKS = "▲△☆★◇♢"
 CLASSES = ["A1", "A2", "A3", "B1", "B2", "B3", "C1", "C2", "C3"]  # 左ほど格上
+CLASS_STEP = 0.10  # クラス1段ぶんの加点（クラス実績値）
+JRA_RANK = -3  # JRAは地方A1より3段格上として扱う
 TH_FRONT = 0.34  # 1角が頭数の上位1/3以内なら「先行」
 
 HEADER = re.compile(r"^(\d+)\s+(?:(\d+)\s+)?(\S+)\s+(\S+[（(]\S+[）)])\s+(\S+)$")
@@ -16,7 +18,17 @@ POP = re.compile(r"^[（(]\s*(\d+)\s*人気\s*[）)]")
 PAST1 = re.compile(r"^(.*?)(\d{2}\.\d{2}\.\d{2})\s+(\S+)\s+(\d+)頭$")
 PAST2 = re.compile(r"^(\S+)\s+(\S+)\s+(\d+)番$")
 SEX = re.compile(r"^(?:牡|牝|セン|セ|騸)\d+")
+BEST = re.compile(r"^(\d+:\d{2}\.\d|[－\-])\s+良\s*(\d+:\d{2}\.\d|[－\-])$")
+REC = re.compile(r"^(全|左|右|場|距)\s+(\d+)-\s*(\d+)-\s*(\d+)-\s*(\d+)\s*$")
 WCHG = re.compile(r"^[（(][+\-＋－±]?\d*[）)]")
+
+
+def to_sec(t):
+    try:
+        mm, ss = t.split(":")
+        return int(mm) * 60 + float(ss)
+    except Exception:
+        return None
 
 
 def to_float(x):
@@ -33,7 +45,7 @@ def class_ranks(name):
 
 
 def parse_race_info(lines):
-    info = {"venue": "", "no": "", "title": "", "cond": "", "class": None, "dist": None}
+    info = {"venue": "", "no": "", "title": "", "cond": "", "class": None, "dist": None, "dir": None}
     for i, l in enumerate(lines):
         s = unicodedata.normalize("NFKC", l)
         m = re.search(r"\d{4}年\d+月\d+日\(.\)\s*(.+?)\s*第(\d+)競走", s)
@@ -48,6 +60,8 @@ def parse_race_info(lines):
                 info["cond"] = s2
                 dm = re.search(r"(\d{3,4})m", s2)
                 info["dist"] = int(dm.group(1)) if dm else None
+                dr = re.search(r"\((左|右)\)", s2)
+                info["dir"] = dr.group(1) if dr else None
                 break
             if s2:
                 title.append(s2)
@@ -67,6 +81,17 @@ def parse_horse(block, prev_waku):
 
     j = next(k for k in range(2, len(block)) if SEX.match(block[k].strip()))
     w = next(k for k in range(j + 1, len(block)) if WCHG.match(block[k].strip()))
+
+    # 最高タイム（今回と同一条件＝同競馬場・同距離・同種別での最高）
+    bm = next((m for m in (BEST.match(l.strip()) for l in block[2:j]) if m), None)
+    best_t = bm.group(1) if bm and bm.group(1)[0].isdigit() else ""
+
+    # 着別成績（1着-2着-3着-4着以下）: 全・左・右・当競馬場(場)・当距離(距)
+    rec = {}
+    for l in block[2:j]:
+        mm = REC.match(l.strip())
+        if mm:
+            rec[mm.group(1)] = tuple(int(x) for x in mm.groups()[1:])
 
     # 過去走の基本情報（日付・着順・頭数・コース）
     past, i = [], 2
@@ -123,7 +148,7 @@ def parse_horse(block, prev_waku):
         r["級順位"] = min(ranks) if ranks else None
         r["級"] = "/".join(dict.fromkeys(found)) if found else "-"
         if unicodedata.normalize("NFKC", r["場"]).startswith("J"):
-            r["級順位"], r["級"] = -1, "JRA"  # 中央（Ｊ○○）は地方のどのクラスより格上扱い
+            r["級順位"], r["級"] = JRA_RANK, "JRA"  # 中央（Ｊ○○）は地方のどのクラスより格上扱い
         if k < len(ent1):
             r["人気"] = int(ent1[k][0])
             r["馬体重"] = ent1[k][1]
@@ -148,10 +173,15 @@ def parse_horse(block, prev_waku):
             r["秒/200m"] = round((int(mm) * 60 + float(ss)) / r["距離"] * 200, 3)
         if "着差" in r and r.get("距離"):
             r["着差換算"] = round(r["着差"] * 1000 / r["距離"], 3)  # 1000m換算の着差
+        if r.get("着順") is not None and "着差" in r:
+            gap = 0.0 if r["着順"] == 1 else r["着差"]  # 1着馬との差（勝ち馬は0）
+            r["勝差"] = gap
+            if r.get("距離"):
+                r["勝差換算"] = round(gap * 1000 / r["距離"], 3)
         runs.append(r)
 
     return {"枠": waku, "馬番": umaban, "馬名": name, "騎手": jockey,
-            "odds": to_float(odds), "人気": pop, "斤量": kin,
+            "odds": to_float(odds), "人気": pop, "best": best_t, "rec": rec, "斤量": kin,
             "馬体重": f"{weight}({wchg.strip('()（）')})" if weight else "",
             "runs": runs}
 
@@ -236,7 +266,131 @@ def add_index(rows):
     return rows
 
 
-def analyze(h, today_rank, n_today, today_dist=None):
+def same_race(ra, na, rb, nb):
+    """2頭の過去走が同じレースか（日付・場・コース・頭数＋1着馬名の整合）。"""
+    k = ("日付", "場", "コース", "頭数")
+    if any(ra[x] != rb[x] for x in k):
+        return False
+    wa, wb = ra.get("1着/2着馬"), rb.get("1着/2着馬")
+    if ra["着順"] == 1:
+        return wb == na
+    if rb["着順"] == 1:
+        return wa == nb
+    return wa is not None and wa == wb
+
+
+def _rec(me, you, you_name):
+    def diff(k):
+        return None if me.get(k) is None or you.get(k) is None else you[k] - me[k]
+    d1, d2, d3 = diff("勝差換算"), diff("上がり"), diff("勝差")
+    return {
+        "相手": you_name, "日付": me["日付"], "場": me["場"], "コース": me["コース"],
+        "頭数": me["頭数"], "級": me["級"], "自着順": me["着順"], "相手着順": you["着順"],
+        "タイム差(秒)": None if d3 is None else round(d3, 1),
+        "着差差(1000m換算)": None if d1 is None else round(d1, 2),
+        "上がり差": None if d2 is None else round(d2, 2),
+    }
+
+
+def head_to_head(horses):
+    """今回の出走馬どうしが過去に同じレースを走った記録。差は＋なら自分が優勢。"""
+    recs = {h["馬番"]: [] for h in horses}
+    for x in range(len(horses)):
+        for y in range(x + 1, len(horses)):
+            A, B = horses[x], horses[y]
+            for ra in A["runs"]:
+                for rb in B["runs"]:
+                    if same_race(ra, A["馬名"], rb, B["馬名"]):
+                        recs[A["馬番"]].append(_rec(ra, rb, B["馬名"]))
+                        recs[B["馬番"]].append(_rec(rb, ra, A["馬名"]))
+    return recs
+
+
+def add_h2h(rows, recs):
+    """対戦成績と、着差差・上がり差を出走馬内のばらつきで割った直接対決指数。"""
+    raw = {}
+    for r in rows:
+        rs = recs.get(r["馬番"], [])
+        ok = [x for x in rs if x["自着順"] is not None and x["相手着順"] is not None]
+        w = sum(x["自着順"] < x["相手着順"] for x in ok)
+        l = sum(x["自着順"] > x["相手着順"] for x in ok)
+        r["対戦数"] = len(rs)
+        r["対戦成績"] = f"{w}勝{l}敗" if rs else ""
+        raw[r["馬番"]] = (avg([x["着差差(1000m換算)"] for x in rs]), avg([x["上がり差"] for x in rs]))
+    sds = {}
+    for i in (0, 1):
+        xs = [v[i] for v in raw.values() if v[i] is not None]
+        if len(xs) >= 2:
+            m = sum(xs) / len(xs)
+            sds[i] = (sum((x - m) ** 2 for x in xs) / len(xs)) ** 0.5
+    for r in rows:
+        a, b = raw[r["馬番"]]
+        zs = [v / sds[i] for i, v in ((0, a), (1, b)) if v is not None and sds.get(i)]
+        r["着差差平均"] = round(a, 2) if a is not None else None
+        r["上がり差平均"] = round(b, 2) if b is not None else None
+        r["直接対決指数"] = round(sum(zs) / len(zs), 2) if zs else None
+    return rows
+
+
+# (列名, 小さいほど良いか, 既定の重み, 表示名)
+FACTORS = [
+    ("_着差換算平均", True, 30, "着差"),
+    ("クラス実績値", False, 20, "クラス実績"),
+    ("向上指数", False, 15, "向上"),
+    ("直接対決指数", False, 15, "直接対決"),
+    ("_持ち秒", True, 10, "持ちタイム"),
+    ("上がり平均", True, 10, "上がり"),
+    ("適性値", False, 10, "適性"),
+]
+
+
+def add_total(rows, weights):
+    """各要素を出走馬内の偏差値(50±10)にして重み付き平均。値のない要素は除き、残りで按分。"""
+    total_w = sum(weights.values())
+    stats = {}
+    for col, _, _, _ in FACTORS:
+        xs = [r[col] for r in rows if r.get(col) is not None]
+        if len(xs) >= 2:
+            m = sum(xs) / len(xs)
+            sd = (sum((x - m) ** 2 for x in xs) / len(xs)) ** 0.5
+            if sd > 0:
+                stats[col] = (m, sd)
+    for r in rows:
+        num = den = 0.0
+        for col, low, _, key in FACTORS:
+            w = weights[key]
+            if w > 0 and col in stats and r.get(col) is not None:
+                m, sd = stats[col]
+                z = (m - r[col]) / sd if low else (r[col] - m) / sd
+                num += w * (50 + 10 * max(-3.0, min(3.0, z)))
+                den += w
+        r["総合点"] = round(num / den, 1) if den else None
+        r["根拠率"] = f"{round(den / total_w * 100)}%" if total_w else ""
+    scores = [r["総合点"] for r in rows if r["総合点"] is not None]
+    for r in rows:
+        r["総合順位"] = 1 + sum(x > r["総合点"] for x in scores) if r["総合点"] is not None else None
+        r["妙味"] = r["今回人気"] - r["総合順位"] if r["総合順位"] is not None else None
+    return rows
+
+
+def rec_info(t):
+    """着別成績(1-2-3-4着以下) → (表示文字列, 複勝率)。"""
+    if not t:
+        return "", None
+    n = sum(t)
+    rate = (t[0] + t[1] + t[2]) / n if n else None
+    txt = f"{t[0]}-{t[1]}-{t[2]}-{t[3]}" + (f" ({rate * 100:.0f}%)" if rate is not None else "")
+    return txt, rate
+
+
+def shrunk(t, prior, k=3):
+    """出走が少ない条件の複勝率が極端にならないよう、全体の複勝率へ寄せる。"""
+    if not t or sum(t) == 0:
+        return None
+    return ((t[0] + t[1] + t[2]) + k * prior) / (sum(t) + k)
+
+
+def analyze(h, today_rank, n_today, today_dist=None, today_dir=None):
     runs = h["runs"]
     m_mean, m_marks, m_good, m_n = vs_mean([r.get("着差") for r in runs])
     f_mean, f_marks, f_good, f_n = vs_mean([r.get("上がり") for r in runs])
@@ -263,6 +417,20 @@ def analyze(h, today_rank, n_today, today_dist=None):
         cls_txt = "なし" if not cr else f"{len(cr)}走" + (
             f" 平均{avg(fins):.1f}着/最高{min(fins)}着" if fins else "")
 
+    cv = None
+    if today_rank is not None:
+        sc = [
+            1 - (r["着順"] - 1) / max(r["頭数"] - 1, 1) + CLASS_STEP * (today_rank - r["級順位"])
+            for r in runs if r["級順位"] is not None and r["着順"] is not None
+        ]
+        cv = round(avg(sc), 2) if sc else None
+
+    rc = h.get("rec", {})
+    t_all = rc.get("全")
+    prior = rec_info(t_all)[1] if t_all and sum(t_all) else 0.3
+    apt = [x for x in (shrunk(rc.get("場"), prior), shrunk(rc.get("距"), prior)) if x is not None]
+    aptitude = round(sum(apt) / len(apt), 3) if apt else None
+
     jname = re.sub(r"[（(].*?[）)]", "", h["騎手"])
     rides = [r for r in runs if r.get("騎手") == jname]
     jf = [r["着順"] for r in rides if r["着順"] is not None]
@@ -279,6 +447,9 @@ def analyze(h, today_rank, n_today, today_dist=None):
         "着差(前走→)": f"{m_marks} {m_good}/{m_n}",
         "上がり平均": round(f_mean, 2) if f_mean is not None else None,
         "上がり(前走→)": f"{f_marks} {f_good}/{f_n}",
+        "持ちタイム": h["best"] or "－",
+        "_持ち秒": to_sec(h["best"]) if h["best"] else None,
+        "_着差換算平均": avg([r.get("着差換算") for r in runs]),
         "着差改善": improve([r.get("着差換算") for r in runs]),
         "上がり改善": improve([r.get("上がり") for r in runs]),
         "タイム改善": time_improve(runs, today_dist),
@@ -288,6 +459,12 @@ def analyze(h, today_rank, n_today, today_dist=None):
         "先行回数": f"{front}/{len(rels)}",
         "今回想定1角": f"約{max(1, round(a_rel * n_today))}番手" if a_rel is not None else "",
         "クラス実績(同格以上)": cls_txt,
+        "クラス実績値": cv,
+        "全成績": rec_info(rc.get("全"))[0],
+        "当場成績": rec_info(rc.get("場"))[0],
+        "当距離成績": rec_info(rc.get("距"))[0],
+        "当回り成績": rec_info(rc.get(today_dir))[0] if today_dir else "",
+        "適性値": aptitude,
         "騎手": jtxt,
     }
 
@@ -341,16 +518,42 @@ today_rank = CLASSES.index(cls) if cls else None
 
 st.markdown(f"**{info['venue']} {info['no']}R** {info['title']}  \n{info['cond']}　／　{len(horses)}頭　／　今回クラス: {cls or '不明'}")
 
-rows = add_index([analyze(h, today_rank, len(horses), info["dist"]) for h in horses])
+st.sidebar.markdown("**総合点の重み**（0にするとその要素を除外）")
+weights = {key: st.sidebar.slider(key, 0, 100, dw, 5) for _, _, dw, key in FACTORS}
+
+h2h = head_to_head(horses)
+rows = add_total(
+    add_h2h(add_index([analyze(h, today_rank, len(horses), info["dist"], info["dir"]) for h in horses]), h2h),
+    weights,
+)
 df = pd.DataFrame(rows)
 
+DESC = ("総合点", "妙味", "向上指数", "直接対決指数", "クラス実績値", "適性値")
 sort_by = st.radio(
     "並び替え",
-    ["馬番", "向上指数", "今回人気", "人気平均", "着差平均", "上がり平均", "頭数比"],
+    ["総合点", "馬番", "妙味", "直接対決指数", "向上指数", "クラス実績値", "適性値", "今回人気",
+     "人気平均", "着差平均", "上がり平均", "頭数比"],
     horizontal=True,
 )
-df = df.sort_values(sort_by, ascending=(sort_by != "向上指数"), na_position="last")
+df = df.sort_values(sort_by, ascending=(sort_by not in DESC), na_position="last")
+lead = ["馬番", "馬名", "総合順位", "総合点", "根拠率", "今回人気", "妙味"]
+df = df[lead + [c for c in df.columns if c not in lead and not c.startswith("_")]]
 st.dataframe(df, hide_index=True)
+top = sorted([r for r in rows if r["総合順位"]], key=lambda r: r["総合順位"])[:3]
+if top:
+    st.markdown("**総合上位**: " + " ／ ".join(f"{r['総合順位']}位 {r['馬番']}番{r['馬名']}({r['総合点']})" for r in top))
+val = [r for r in rows if r["妙味"] is not None and r["妙味"] >= 3]
+if val:
+    st.markdown("**人気より総合点が高い馬（妙味候補）**: " + "、".join(
+        f"{r['馬番']}番{r['馬名']}({r['今回人気']}人気→総合{r['総合順位']}位)" for r in val))
+st.caption(
+    "【総合点】着差・クラス実績・向上・直接対決・持ちタイム・上がりを、各々出走馬内の偏差値(50±10)にして"
+    "サイドバーの重みで平均。値がない要素は除いて残りで計算し、根拠率＝使えた重みの割合（低いほど参考程度）。"
+    "妙味＝今回人気−総合順位（＋なら人気より評価が高い）。持ちタイムは今回と同じ競馬場・距離での最高タイム。"
+    "【適性値】当競馬場・当距離の複勝率（出走が少ない条件は全体の複勝率へ寄せて補正）の平均。"
+    "成績欄は『1着-2着-3着-4着以下（複勝率）』、全成績はJRA・海外を含み、当回りは今回の左右回りの成績(JRA含む)。"
+    "重みは仮置きで、的中結果で検証していないため参考値です。"
+)
 st.caption(
     "○＝その馬の5走平均より良い走（着差が小さい／上がりが速い）。左から前走→5走前。"
     "着差は1着馬との差（自分が1着の時は2着との差をマイナスで表示）。"
@@ -365,6 +568,13 @@ st.caption(
     "距離・馬場・相手が違う走を比べるため目安です。同距離の走が2走未満の馬はタイムの項目が空欄になります。"
 )
 
+st.caption(
+    "【直接対決指数】今回の出走馬どうしが過去に同じレースを走っていた場合の、相手との差。"
+    "着差差(1000m換算・秒)と上がり差を、出走馬内のばらつきで割って平均（＋＝相手より優勢、同じレース内の着差差＝タイム差）。"
+    "【クラス実績値】過去走ごとに『着順の位置(1着＝1、最下位＝0)』に、今回との格差1段あたり"
+    f"{CLASS_STEP}を加減(JRAはA1より{-JRA_RANK}段上)して平均。クラスが読めない走は除外。"
+)
+
 front = [r["馬名"] for r in rows if r["脚質"] in ("逃", "先")]
 st.markdown(f"**逃げ・先行タイプ: {len(front)}頭** {'、'.join(front)}")
 
@@ -376,3 +586,12 @@ cols = ["走", "日付", "場", "コース", "馬場", "頭数", "級", "着順"
         "着差換算", "上がり", "秒/200m", "通過", "騎手", "斤量", "レース名"]
 detail = pd.DataFrame(h["runs"])
 st.dataframe(detail[[c for c in cols if c in detail.columns]], hide_index=True)
+
+st.markdown("#### 直接対決（同じレースを走った相手）")
+sel2 = st.selectbox("基準にする馬", [f"{x['馬番']} {x['馬名']}" for x in horses], key="h2h_sel")
+rs = h2h.get(int(sel2.split()[0]), [])
+if rs:
+    st.dataframe(pd.DataFrame(rs), hide_index=True)
+    st.caption("差は＋なら選んだ馬のほうが優勢（先着・着差が小さい・上がりが速い）。")
+else:
+    st.info("この馬と今回の出走馬が同じレースを走った記録は、過去5走の中にありません。")
