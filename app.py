@@ -8,9 +8,20 @@ import streamlit as st
 # 解析部分（keiba.go.jp 出馬表ページを全選択コピーしたテキスト用）
 # =====================================================
 MARKS = "▲△☆★◇♢"
-CLASSES = ["A1", "A2", "A3", "B1", "B2", "B3", "C1", "C2", "C3"]  # 左ほど格上
+# クラス体系（地区ごと）。レベル＝基準値＋番号（小さいほど上位）。番号なしの級は基準値＋1。
+# 東海(笠松・名古屋)の番号は「組」。A/B/Cの間は十分離して、別の級どうしは常に大差扱いにする。
+SCHEMES = {
+    "南関東": (["浦和", "船橋", "大井", "川崎"], {"A": 0, "B": 2, "C": 5}),
+    "兵庫": (["園田", "姫路"], {"A": 0, "B": 2, "C": 4}),
+    "北海道": (["門別"], {"A": 0, "B": 4, "C": 8}),
+    "岩手": (["盛岡", "水沢"], {"A": 0, "B": 1, "C": 3}),
+    "東海": (["笠松", "名古屋"], {"A": 0, "B": 20, "C": 40}),
+    "高知": (["高知"], {"A": 0, "B": 1, "C": 2}),
+    "佐賀": (["佐賀"], {"A": 0, "B": 2, "C": 3}),
+}
 CLASS_STEP = 0.10  # クラス1段ぶんの加点（クラス実績値）
-JRA_RANK = -3  # JRAは地方A1より3段格上として扱う
+MAX_STEP = 3  # 加減は最大±3段まで
+JRA_LEVEL = -99  # JRAは地方のどのクラスより格上（常に+3段）
 TH_FRONT = 0.34  # 1角が頭数の上位1/3以内なら「先行」
 
 HEADER = re.compile(r"^(\d+)\s+(?:(\d+)\s+)?(\S+)\s+(\S+[（(]\S+[）)])\s+(\S+)$")
@@ -38,14 +49,35 @@ def to_float(x):
         return None
 
 
-def class_ranks(name):
+def scheme_of(venue):
+    v = unicodedata.normalize("NFKC", venue or "")
+    if v.startswith("J"):
+        return "JRA"
+    for name, (venues, _) in SCHEMES.items():
+        if any(v.startswith(x) for x in venues):
+            return name
+    return None
+
+
+def class_level(name, scheme):
+    """レース名 → (レベル, 表記)。小さいほど上位。混合戦は最上位側。読めなければ (None, '-')。"""
+    if scheme == "JRA":
+        return JRA_LEVEL, "JRA"
+    if scheme not in SCHEMES:
+        return None, "-"
+    base = SCHEMES[scheme][1]
     s = unicodedata.normalize("NFKC", name or "")
-    found = [c for c in re.findall(r"(?<![A-Za-z])([ABC][1-3])", s) if c in CLASSES]
-    return [CLASSES.index(c) for c in found], found
+    found = re.findall(r"(?<![A-Za-z])([ABC])(\d{1,2})(?!\d|歳)", s)
+    if not found:
+        found = [(c, "") for c in re.findall(r"(?<![A-Za-z])([ABC])(?![A-Za-z\d])", s)]
+    if not found:
+        return None, "-"
+    levels = [base[c] + (int(n) if n else 1) for c, n in found]
+    return min(levels), "/".join(dict.fromkeys(c + n for c, n in found))
 
 
 def parse_race_info(lines):
-    info = {"venue": "", "no": "", "title": "", "cond": "", "class": None, "dist": None, "dir": None}
+    info = {"venue": "", "no": "", "title": "", "cond": "", "class": None, "level": None, "scheme": None, "dist": None, "dir": None}
     for i, l in enumerate(lines):
         s = unicodedata.normalize("NFKC", l)
         m = re.search(r"\d{4}年\d+月\d+日\(.\)\s*(.+?)\s*第(\d+)競走", s)
@@ -66,9 +98,10 @@ def parse_race_info(lines):
             if s2:
                 title.append(s2)
         info["title"] = " ".join(title)
-        ranks, found = class_ranks(info["title"])
-        if ranks:
-            info["class"] = CLASSES[min(ranks)]
+        info["scheme"] = scheme_of(info["venue"])
+        lvl, lab = class_level(info["title"], info["scheme"])
+        if lvl is not None:
+            info["level"], info["class"] = lvl, lab
         break
     return info
 
@@ -127,47 +160,49 @@ def parse_horse(block, prev_waku):
     weight = sire[2].strip() if len(sire) > 2 else ""
     wchg = block[w].split("\t")[0].strip()
 
-    # 人気・馬体重・騎手・斤量
-    ent1 = re.findall(r"(\d+)人\s+(\S+)\s+(\S+)\s+(\d+(?:\.\d)?)", block[w])
-    # タイム・通過順・上がり
-    ent2 = re.findall(r"(\d+:\d{2}\.\d)\s+(?:([\d\-]+)\s+)?(\d{2}\.\d)",
-                      block[w + 1] if w + 1 < len(block) else "")
-    # 1着馬との差・1着馬名
-    ent3 = []
-    if w + 2 < len(block):
-        t3 = block[w + 2].split("\t")
-        tail = "\t".join(t3[2:]) if len(t3) > 2 else block[w + 2]
-        ent3 = re.findall(r"(\d+\.\d)\s+(\S+)", tail)
+    # 競走成績の各欄（タブ区切りの位置で対応させる。取止・出走前の走は空欄になるため）
+    def cells(i, skip):
+        if i >= len(block):
+            return []
+        t = block[i].split("\t")
+        return [c.strip() for c in t[skip:]] if len(t) > skip else []
+
+    E1 = re.compile(r"^(?:(\d+)人)?\s*(\S+)\s+(\S+)\s+(\d+(?:\.\d)?)$")  # 人気 馬体重 騎手 斤量
+    E2 = re.compile(r"(\d+:\d{2}\.\d)\s+(?:([\d\-]+)\s+)?(\d{2}\.\d)")  # タイム 通過順 上がり
+    E3 = re.compile(r"^(\d+\.\d)\s+(\S+)$")  # 1着馬との差 1着馬名
+    ent1 = [E1.match(x) for x in cells(w, 1)]
+    ent2 = [E2.search(x) for x in cells(w + 1, 2)]
+    ent3 = [E3.match(x) for x in cells(w + 2, 3)]
 
     runs = []
     for k, p in enumerate(past):
         r = dict(p)
         r["走"] = ["前走", "前々走", "3走前", "4走前", "5走前"][k]
         r["レース名"] = names[k] if k < len(names) else ""
-        ranks, found = class_ranks(r["レース名"])
-        r["級順位"] = min(ranks) if ranks else None
-        r["級"] = "/".join(dict.fromkeys(found)) if found else "-"
-        if unicodedata.normalize("NFKC", r["場"]).startswith("J"):
-            r["級順位"], r["級"] = JRA_RANK, "JRA"  # 中央（Ｊ○○）は地方のどのクラスより格上扱い
-        if k < len(ent1):
-            r["人気"] = int(ent1[k][0])
-            r["馬体重"] = ent1[k][1]
-            r["騎手"] = ent1[k][2].lstrip(MARKS)
-            r["斤量"] = ent1[k][2][:1] if ent1[k][2][:1] in MARKS else ""
-            r["斤量"] += ent1[k][3]
-        if k < len(ent2):
-            r["タイム"] = ent2[k][0]
-            r["通過"] = ent2[k][1] or ""
-            r["上がり"] = to_float(ent2[k][2])
-            if r["通過"] and r["通過"][0].isdigit():
+        r["区分"] = scheme_of(r["場"])
+        r["級順位"], r["級"] = class_level(r["レース名"], r["区分"])
+        m1 = ent1[k] if k < len(ent1) else None
+        if m1:
+            r["人気"] = int(m1.group(1)) if m1.group(1) else None
+            r["馬体重"] = m1.group(2)
+            jk = m1.group(3)
+            r["騎手"] = jk.lstrip(MARKS)
+            r["斤量"] = (jk[:1] if jk[:1] in MARKS else "") + m1.group(4)
+        m2 = ent2[k] if k < len(ent2) else None
+        if m2:
+            r["タイム"] = m2.group(1)
+            r["通過"] = m2.group(2) or ""
+            r["上がり"] = to_float(m2.group(3))
+            if r["通過"] and r["通過"][0].isdigit() and r["頭数"] > 0:
                 pos = int(r["通過"].split("-")[0])
                 r["1角"] = pos
                 r["頭数比"] = pos / r["頭数"]
-        if k < len(ent3):
-            mg = to_float(ent3[k][0])
+        m3 = ent3[k] if k < len(ent3) else None
+        if m3:
+            mg = to_float(m3.group(1))
             if mg is not None and r["着順"] is not None:
                 r["着差"] = (-mg if mg else 0.0) if r["着順"] == 1 else mg  # 勝ち馬は2着との差をマイナス
-            r["1着/2着馬"] = ent3[k][1]
+            r["1着/2着馬"] = m3.group(2)
         if r.get("タイム") and r.get("距離"):
             mm, ss = r["タイム"].split(":")
             r["秒/200m"] = round((int(mm) * 60 + float(ss)) / r["距離"] * 200, 3)
@@ -390,7 +425,7 @@ def shrunk(t, prior, k=3):
     return ((t[0] + t[1] + t[2]) + k * prior) / (sum(t) + k)
 
 
-def analyze(h, today_rank, n_today, today_dist=None, today_dir=None):
+def analyze(h, today_rank, n_today, today_dist=None, today_dir=None, today_scheme=None):
     runs = h["runs"]
     m_mean, m_marks, m_good, m_n = vs_mean([r.get("着差") for r in runs])
     f_mean, f_marks, f_good, f_n = vs_mean([r.get("上がり") for r in runs])
@@ -409,10 +444,13 @@ def analyze(h, today_rank, n_today, today_dist=None, today_dir=None):
     else:
         style = "追"
 
+    def usable(r):  # 今回と同じ地区のクラス体系の走（JRAは常に可）だけ比べる
+        return r["級順位"] is not None and r["区分"] in (today_scheme, "JRA")
+
     if today_rank is None:
         cls_txt = "判定不可"
     else:
-        cr = [r for r in runs if r["級順位"] is not None and r["級順位"] <= today_rank]
+        cr = [r for r in runs if usable(r) and r["着順"] is not None and r["級順位"] <= today_rank]
         fins = [r["着順"] for r in cr if r["着順"] is not None]
         cls_txt = "なし" if not cr else f"{len(cr)}走" + (
             f" 平均{avg(fins):.1f}着/最高{min(fins)}着" if fins else "")
@@ -420,8 +458,9 @@ def analyze(h, today_rank, n_today, today_dist=None, today_dir=None):
     cv = None
     if today_rank is not None:
         sc = [
-            1 - (r["着順"] - 1) / max(r["頭数"] - 1, 1) + CLASS_STEP * (today_rank - r["級順位"])
-            for r in runs if r["級順位"] is not None and r["着順"] is not None
+            1 - (r["着順"] - 1) / max(r["頭数"] - 1, 1)
+            + CLASS_STEP * max(-MAX_STEP, min(MAX_STEP, today_rank - r["級順位"]))
+            for r in runs if usable(r) and r["着順"] is not None
         ]
         cv = round(avg(sc), 2) if sc else None
 
@@ -511,10 +550,11 @@ if not horses:
 if errors:
     st.warning("読み取れなかった馬: " + " / ".join(errors))
 
-auto = info["class"]
-choice = st.sidebar.selectbox("今回のクラス", [f"自動({auto or '判定不可'})"] + CLASSES)
-cls = auto if choice.startswith("自動") else choice
-today_rank = CLASSES.index(cls) if cls else None
+manual = st.sidebar.text_input("今回のクラス（手入力・例 C7 / A2）", placeholder=f"空欄で自動({info['class'] or '判定不可'})")
+if manual.strip():
+    today_level, cls = class_level(manual.strip(), info["scheme"])
+else:
+    today_level, cls = info["level"], info["class"]
 
 st.markdown(f"**{info['venue']} {info['no']}R** {info['title']}  \n{info['cond']}　／　{len(horses)}頭　／　今回クラス: {cls or '不明'}")
 
@@ -523,7 +563,7 @@ weights = {key: st.sidebar.slider(key, 0, 100, dw, 5) for _, _, dw, key in FACTO
 
 h2h = head_to_head(horses)
 rows = add_total(
-    add_h2h(add_index([analyze(h, today_rank, len(horses), info["dist"], info["dir"]) for h in horses]), h2h),
+    add_h2h(add_index([analyze(h, today_level, len(horses), info["dist"], info["dir"], info["scheme"]) for h in horses]), h2h),
     weights,
 )
 df = pd.DataFrame(rows)
@@ -557,7 +597,7 @@ st.caption(
 st.caption(
     "○＝その馬の5走平均より良い走（着差が小さい／上がりが速い）。左から前走→5走前。"
     "着差は1着馬との差（自分が1着の時は2着との差をマイナスで表示）。"
-    "脚質は1角位置÷頭数の平均（逃≤0.2／先≤0.4／差≤0.65／追）。先行回数は1角が頭数の上位1/3以内だった走。クラス実績は、過去走のレース名にC1等の表記がある走だけ判定（C1/C2混合戦は格上側で数えます。JRAは格上として必ず数え、未格付・「Ａ一組」など数字のない表記は対象外）。"
+    "脚質は1角位置÷頭数の平均（逃≤0.2／先≤0.4／差≤0.65／追）。先行回数は1角が頭数の上位1/3以内だった走。クラス実績は、今回と同じ地区のクラス表記（A1・C2、笠松は「Ｃ７」など）が読めた走だけ判定（混合戦は上位側。JRAは格上。未格付や別地区の走は対象外）。"
 )
 
 st.caption(
@@ -572,7 +612,8 @@ st.caption(
     "【直接対決指数】今回の出走馬どうしが過去に同じレースを走っていた場合の、相手との差。"
     "着差差(1000m換算・秒)と上がり差を、出走馬内のばらつきで割って平均（＋＝相手より優勢、同じレース内の着差差＝タイム差）。"
     "【クラス実績値】過去走ごとに『着順の位置(1着＝1、最下位＝0)』に、今回との格差1段あたり"
-    f"{CLASS_STEP}を加減(JRAはA1より{-JRA_RANK}段上)して平均。クラスが読めない走は除外。"
+    f"{CLASS_STEP}を加減(最大±{MAX_STEP}段、JRAは常に+{MAX_STEP}段)して平均。"
+    "今回と同じ地区(南関東・兵庫・東海など)のクラス体系で読めた走だけを対象にし、別地区の走は除外。"
 )
 
 front = [r["馬名"] for r in rows if r["脚質"] in ("逃", "先")]
